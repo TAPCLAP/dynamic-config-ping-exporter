@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
-	"syscall"
 	"reflect"
+	"strings"
+	"syscall"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -22,11 +24,46 @@ import (
 )
 
 const (
-	fieldManager         = "dynamic-config-ping-exporter"
-	defaultConfigMapName = "ping-exporter-config"
+	fieldManager = "dynamic-config-ping-exporter"
+
+	defaultStaticConfigMapName = "ping-exporter-static"
+	defaultOutputConfigMapName = "ping-exporter-config"
 )
 
+// defaultPingExporterConfigYAML matches ping_exporter defaults used when ConfigMap is missing or invalid.
+const defaultPingExporterConfigYAML = `
+targets: []
+dns:
+  refresh: 3m
+ping:
+  history-size: 15
+  interval: 5s
+  payload-size: 64
+  timeout: 1s
+options:
+  disableIPv6: true
+  disableIPv4: false
+`
+
+// parsePingExporterConfigYAML unmarshals ping_exporter config from YAML (e.g. config.yaml key).
+func parsePingExporterConfigYAML(data []byte) (pconfig.Config, error) {
+	var cfg pconfig.Config
+	err := yaml.Unmarshal(data, &cfg)
+	return cfg, err
+}
+
+func defaultPingExporterConfig() (pconfig.Config, error) {
+	return parsePingExporterConfigYAML([]byte(strings.TrimSpace(defaultPingExporterConfigYAML)))
+}
+
 func main() {
+	staticConfigMapName := flag.String("static-configmap", defaultStaticConfigMapName, "ConfigMap name to read static config.yaml from")
+	outputConfigMapName := flag.String("output-configmap", defaultOutputConfigMapName, "ConfigMap name to create/update with merged static+dynamic config (only config.yaml key)")
+	flag.Parse()
+
+	if *staticConfigMapName == *outputConfigMapName {
+		klog.Fatalf("static-configmap and output-configmap must be different names (got %q for both)", *staticConfigMapName)
+	}
 
 	config, err := rest.InClusterConfig()
 	if err != nil {
@@ -48,11 +85,6 @@ func main() {
 		namespace = string(defaultNamespace)
 	}
 
-	configMapName := os.Getenv("CONFIGMAP")
-	if configMapName == "" {
-		configMapName = defaultConfigMapName
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -64,13 +96,13 @@ func main() {
 		cancel()
 	}()
 
-	cfg := getConfig(&ctx, clientset, namespace, configMapName)
-	defaultTargets := getDefaultTargets(cfg.Targets)
+	cfg := getConfig(&ctx, clientset, namespace, *staticConfigMapName)
+	defaultTargets := append([]pconfig.TargetConfig(nil), cfg.Targets...)
 
 	// read current nodes to targets
 	tries := 0
 	watcherNodesReopenTries := 0
-	watcherConfigMapReopenTries := 0
+	watcherStaticConfigMapReopenTries := 0
 	for {
 		currentTargets, err := getNodesIP(&ctx, clientset)
 		if err != nil {
@@ -89,7 +121,7 @@ func main() {
 
 	tries = 0
 	for {
-		err = updateConfigMap(&ctx, clientset, namespace, configMapName, cfg)
+		err = updateConfigMap(&ctx, clientset, namespace, *outputConfigMapName, cfg)
 		if err != nil {
 			klog.Errorf("Failed to update ConfigMap: %v. Sleep 5 seconds and try again", err)
 			time.Sleep(5 * time.Second)
@@ -110,21 +142,21 @@ func main() {
 	}
 	defer watcher.Stop()
 
-	// watch coonfigMap
-	watcherConfigMap, err := clientset.CoreV1().ConfigMaps(namespace).Watch(ctx, metav1.ListOptions{
-		FieldSelector: fmt.Sprintf("metadata.name=%s", configMapName),
+	// watch static ConfigMap to reload when admins change static targets
+	watcherStaticConfigMap, err := clientset.CoreV1().ConfigMaps(namespace).Watch(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("metadata.name=%s", *staticConfigMapName),
 	})
 	if err != nil {
-		klog.Fatalf("Failed to watch ConfigMap '%s': %v", configMapName, err)
+		klog.Fatalf("Failed to watch static ConfigMap '%s': %v", *staticConfigMapName, err)
 	}
-	defer watcherConfigMap.Stop()
+	defer watcherStaticConfigMap.Stop()
 
 	timer := time.NewTimer(5 * time.Minute)
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		
+
 		// Get nodes by timeout
 		case <-timer.C:
 			klog.Infof("Get nodes by timeout")
@@ -134,9 +166,10 @@ func main() {
 				continue
 			}
 			newTargets := uniqueTargets(append(defaultTargets, currentTargets...))
-			
-			if compareTargets(cfg.Targets, newTargets) {
-				err = updateConfigMap(&ctx, clientset, namespace, configMapName, cfg)
+
+			if !compareTargets(cfg.Targets, newTargets) {
+				cfg.Targets = newTargets
+				err = updateConfigMap(&ctx, clientset, namespace, *outputConfigMapName, cfg)
 				if err != nil {
 					klog.Errorf("Failed to update ConfigMap: %v", err)
 				}
@@ -176,7 +209,7 @@ func main() {
 				if !nodeExistsInTargets(*node, cfg.Targets) {
 					klog.Infof("New node added: %s", node.Name)
 					cfg.Targets = uniqueTargets(addNodeToTargets(*node, cfg.Targets))
-					err = updateConfigMap(&ctx, clientset, namespace, configMapName, cfg)
+					err = updateConfigMap(&ctx, clientset, namespace, *outputConfigMapName, cfg)
 					if err != nil {
 						klog.Errorf("Failed to update ConfigMap: %v", err)
 					}
@@ -184,64 +217,57 @@ func main() {
 
 			case watch.Deleted:
 				cfg.Targets = uniqueTargets(removeNodeFromTargets(*node, cfg.Targets))
-				err = updateConfigMap(&ctx, clientset, namespace, configMapName, cfg)
+				err = updateConfigMap(&ctx, clientset, namespace, *outputConfigMapName, cfg)
 				if err != nil {
 					klog.Errorf("Failed to update ConfigMap: %v", err)
 				}
 				klog.Infof("Node deleted: %s", node.Name)
 			}
-		
-		// Watch ConfigMap
-		case event := <-watcherConfigMap.ResultChan():
+
+		// Watch static ConfigMap — reload merged config when static part changes
+		case event := <-watcherStaticConfigMap.ResultChan():
 
 			if event.Object == nil {
-				klog.Error("The watch channel configMap has been closed")
-				watcherConfigMap.Stop()
-				watcherConfigMap, err = clientset.CoreV1().ConfigMaps(namespace).Watch(ctx, metav1.ListOptions{
-					FieldSelector: fmt.Sprintf("metadata.name=%s", configMapName),
+				klog.Error("The watch channel for static ConfigMap has been closed")
+				watcherStaticConfigMap.Stop()
+				watcherStaticConfigMap, err = clientset.CoreV1().ConfigMaps(namespace).Watch(ctx, metav1.ListOptions{
+					FieldSelector: fmt.Sprintf("metadata.name=%s", *staticConfigMapName),
 				})
 				if err != nil {
 					klog.Errorf("Failed to reopen watch channel: %v", err)
-					watcherConfigMapReopenTries++
+					watcherStaticConfigMapReopenTries++
 					time.Sleep(1 * time.Second)
-					if watcherConfigMapReopenTries > 20 {
-						klog.Fatalf("Failed to reopen watch channel for configMap after 20 tries")
+					if watcherStaticConfigMapReopenTries > 20 {
+						klog.Fatalf("Failed to reopen watch channel for static ConfigMap after 20 tries")
 					}
 					continue
 				}
-				watcherConfigMapReopenTries = 0
+				watcherStaticConfigMapReopenTries = 0
 				continue
 			}
 
-			configMap, ok := event.Object.(*corev1.ConfigMap)
+			if event.Type != watch.Modified {
+				continue
+			}
+
+			_, ok := event.Object.(*corev1.ConfigMap)
 			if !ok {
 				klog.Errorf("Unexpected object type: %T", event.Object)
 				time.Sleep(1 * time.Second)
 				continue
 			}
-			
-			switch event.Type {
-			case watch.Modified:
-				klog.Infof("ConfigMap modified")
-				lastFieldManager := getLastFieldManager(configMap)
-				klog.Infof("Last field manager: %s", lastFieldManager)
 
-				if lastFieldManager != fieldManager {
-					klog.Infof("ConfigMap was changed by another the field manager: %s. Reread the config", lastFieldManager)
-					cfg := getConfig(&ctx, clientset, namespace, configMapName)
-					defaultTargets = getDefaultTargets(cfg.Targets)
-					currentTargets, err := getNodesIP(&ctx, clientset)
-					if err != nil {
-						klog.Errorf("Failed to get nodes IP: %v", err)
-						continue
-					}
-					cfg.Targets = uniqueTargets(append(defaultTargets, currentTargets...))
-					
-					err = updateConfigMap(&ctx, clientset, namespace, configMapName, cfg)
-					if err != nil {
-						klog.Errorf("Failed to update ConfigMap: %v", err)
-					}
-				}
+			klog.Infof("Static ConfigMap modified; reloading and merging with node targets")
+			cfg = getConfig(&ctx, clientset, namespace, *staticConfigMapName)
+			defaultTargets = append([]pconfig.TargetConfig(nil), cfg.Targets...)
+			currentTargets, err := getNodesIP(&ctx, clientset)
+			if err != nil {
+				klog.Errorf("Failed to get nodes IP: %v", err)
+				continue
+			}
+			cfg.Targets = uniqueTargets(append(defaultTargets, currentTargets...))
+			if err := updateConfigMap(&ctx, clientset, namespace, *outputConfigMapName, cfg); err != nil {
+				klog.Errorf("Failed to update output ConfigMap: %v", err)
 			}
 		}
 	}
@@ -287,90 +313,76 @@ func getConfig(ctx *context.Context, clientset *kubernetes.Clientset, namespace 
 		break
 	}
 
-	defaultConfigYaml := `
-targets: []
-dns:
-	refresh: 3m
-ping:
-	history-size: 15
-	interval: 5s
-	payload-size: 64
-	timeout: 1s
-options:
-	disableIPv6: true
-	disableIPv4: false
-`
-
 	useDefaultConfig := func() pconfig.Config {
-		var cfg pconfig.Config
-		err := yaml.Unmarshal([]byte(defaultConfigYaml), &cfg)
+		cfg, err := defaultPingExporterConfig()
 		if err != nil {
-			klog.Fatalf("[getConfig]: failed to parse default YAML config: %s, err: %v. Please write to developer", defaultConfigYaml, err)
+			klog.Fatalf("[getConfig]: failed to parse default YAML config: %s, err: %v. Please write to developer", defaultPingExporterConfigYAML, err)
 		}
 		return cfg
 	}
 
-	var cfg pconfig.Config
-
 	if found {
 		configYAML, ok := configMap.Data["config.yaml"]
 		if ok {
-			err := yaml.Unmarshal([]byte(configYAML), &cfg)
+			cfg, err := parsePingExporterConfigYAML([]byte(configYAML))
 			if err != nil {
-				klog.Errorf("[getConfig]: failed to parse YAML from configMap '%s' key '%s': %v. Use default config: %s", configMapName, namespace, err, defaultConfigYaml)
+				klog.Errorf("[getConfig]: failed to parse YAML from configMap '%s' namespace '%s' key 'config.yaml': %v. Use default config: %s", configMapName, namespace, err, defaultPingExporterConfigYAML)
 				return useDefaultConfig()
 			}
 			return cfg
 		} else {
-			klog.Errorf("[getConfig]: key 'config.yaml' not found in ConfigMap '%s', use default config: %s", configMapName, defaultConfigYaml)
+			klog.Errorf("[getConfig]: key 'config.yaml' not found in ConfigMap '%s', use default config: %s", configMapName, defaultPingExporterConfigYAML)
 			return useDefaultConfig()
 		}
 	} else {
-		klog.Errorf("[getConfig]: ConfigMap '%s' not found, use default config: %s", configMapName, defaultConfigYaml)
+		klog.Errorf("[getConfig]: ConfigMap '%s' not found, use default config: %s", configMapName, defaultPingExporterConfigYAML)
 		return useDefaultConfig()
 	}
 }
 
 func updateConfigMap(ctx *context.Context, clientset *kubernetes.Clientset, namespace string, configMapName string, cfg pconfig.Config) error {
-	_, err := clientset.CoreV1().ConfigMaps(namespace).Get(*ctx, configMapName, metav1.GetOptions{})
-
-	create := false
-	if err != nil && !k8sErrors.IsNotFound(err) {
-		klog.Infof("[updateConfigMap]: failed to get ConfigMap: %v. Create new configMap", err)
-		create = true
-	} 
-	
+	existing, configMapGetErr := clientset.CoreV1().ConfigMaps(namespace).Get(*ctx, configMapName, metav1.GetOptions{})
+	if configMapGetErr != nil && !k8sErrors.IsNotFound(configMapGetErr) {
+		return fmt.Errorf("[updateConfigMap]: get ConfigMap: %w", configMapGetErr)
+	}
 
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("[updateConfigMap]: Failed to marshal config to YAML: %v", err)
 	}
-	configMap := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapName,
-			Namespace: namespace,
-		},
-		Data: map[string]string{
-			"config.yaml": string(data),
-		},
-	}
+	yamlStr := string(data)
 
-	if create {
-		_, err = clientset.CoreV1().ConfigMaps(namespace).Create(*ctx, configMap, metav1.CreateOptions{
+	if k8sErrors.IsNotFound(configMapGetErr) {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      configMapName,
+				Namespace: namespace,
+			},
+			Data: map[string]string{
+				"config.yaml": yamlStr,
+			},
+		}
+		_, err = clientset.CoreV1().ConfigMaps(namespace).Create(*ctx, cm, metav1.CreateOptions{
 			FieldManager: fieldManager,
 		})
-	} else {
-		_, err = clientset.CoreV1().ConfigMaps(configMap.Namespace).Update(*ctx, configMap, metav1.UpdateOptions{
-			FieldManager: fieldManager,
-		})
+		if err != nil {
+			return fmt.Errorf("[updateConfigMap]: create ConfigMap: %w", err)
+		}
+		klog.Info("[updateConfigMap]: ConfigMap created successfully")
+		return nil
 	}
 
+	// Replace Data so only config.yaml remains (drops any other keys)
+	existing.Data = map[string]string{
+		"config.yaml": yamlStr,
+	}
+	_, err = clientset.CoreV1().ConfigMaps(namespace).Update(*ctx, existing, metav1.UpdateOptions{
+		FieldManager: fieldManager,
+	})
 	if err != nil {
-		return fmt.Errorf("[updateConfigMap]: Failed to apply or create ConfigMap: %v", err)
-	} else {
-		klog.Info("[updateConfigMap]: ConfigMap apply/create successfully")
+		return fmt.Errorf("[updateConfigMap]: update ConfigMap: %w", err)
 	}
-
+	klog.Info("[updateConfigMap]: ConfigMap updated successfully")
 	return nil
 }
 
@@ -419,7 +431,6 @@ func addNodeToTargets(node corev1.Node, targets []pconfig.TargetConfig) []pconfi
 			Addr: nodeIP,
 			Labels: map[string]string{
 				"target_name": node.Name,
-				"added_by":    fieldManager,
 			},
 		})
 	}
@@ -439,26 +450,4 @@ func nodeExistsInTargets(node corev1.Node, targets []pconfig.TargetConfig) bool 
 
 func compareTargets(targets1 []pconfig.TargetConfig, targets2 []pconfig.TargetConfig) bool {
 	return reflect.DeepEqual(targets1, targets2)
-}
-
-func getLastFieldManager(configMap *corev1.ConfigMap) string {
-	lastFieldManager := ""
-	lastModified := time.Time{}
-	for _, field := range configMap.ManagedFields {
-		if field.Time.After(lastModified) {
-			lastModified = field.Time.Time
-			lastFieldManager = field.Manager
-		}
-	}
-	return lastFieldManager
-}
-
-func getDefaultTargets(targets []pconfig.TargetConfig) []pconfig.TargetConfig {
-	defaultTargets := make([]pconfig.TargetConfig, 0)
-	for _, target := range targets {
-		if _, exists := target.Labels["added_by"]; !exists || target.Labels["added_by"] != fieldManager {
-			defaultTargets = append(defaultTargets, target)
-		}
-	}
-	return defaultTargets
 }
